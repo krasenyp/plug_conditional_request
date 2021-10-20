@@ -3,14 +3,15 @@ defmodule Plug.ConditionalRequest.Helpers do
 
   import Plug.Conn
 
+  require Logger
+
+  defguardp is_query(method) when method in ["GET", "HEAD"]
+  defguardp is_mutation(method) when method in ["POST", "PUT", "PATCH", "DELETE"]
+
   @spec when_stale(Conn.t(), Enum.t(), function()) :: Conn.t()
-  def when_stale(conn, data, fun) when is_function(fun, 1) do
-    validators = conn.private[:validators]
-    generate_etag = Keyword.get(validators, :etag, fn _ -> nil end)
-    last_modified = Keyword.get(validators, :last_modified, fn _ -> nil end)
-    data = Enum.into(data, %{})
-    etag = generate_etag.(data)
-    modified = last_modified.(data)
+  def when_stale(%Conn{method: method} = conn, data, fun)
+      when is_query(method) and is_function(fun, 1) do
+    {etag, modified} = get_validators(conn, data)
 
     conn =
       conn
@@ -24,29 +25,83 @@ defmodule Plug.ConditionalRequest.Helpers do
     end
   end
 
+  def when_stale(conn, _data, _fun) do
+    Logger.warn("Function \"when_stale\" is a no-op on methods other than GET and HEAD.")
+
+    conn
+  end
+
+  @spec when_fresh(Conn.t(), Enum.t(), function()) :: Conn.t()
+  def when_fresh(%Conn{method: method} = conn, data, fun)
+      when is_mutation(method) and is_function(fun, 0) do
+    {etag, modified} = get_validators(conn, data)
+
+    if stale?(conn, etag, modified) do
+      send_resp(conn, 409, "")
+    else
+      fun.()
+    end
+  end
+
+  def when_fresh(conn, _data, _fun) do
+    Logger.warn(
+      "Function \"when_fresh\" is a no-op on methods other than PUT, POST, PATCH and DELETE."
+    )
+
+    conn
+  end
+
+  defp get_validators(conn, data) do
+    validators = conn.private[:validators]
+    generate_etag = Keyword.get(validators, :etag, fn _ -> nil end)
+    last_modified = Keyword.get(validators, :last_modified, fn _ -> nil end)
+    data = Enum.into(data, %{})
+    etag = generate_etag.(data)
+    modified = last_modified.(data)
+
+    {etag, modified}
+  end
+
   def stale?(_, nil, nil), do: true
 
   def stale?(conn, etag, last_modified) do
-    none_match =
-      conn
-      |> get_req_header("if-none-match")
-      |> List.first()
+    none_match = get_fingerprint_header(conn)
+    modified_since = get_timestamp_header(conn)
 
-    modified_since =
-      conn
-      |> get_req_header("if-modified_since")
-      |> List.first()
-
-    none_match?(none_match, etag) or modified_since?(modified_since, last_modified)
+    not fingerprint_match?(none_match, etag) or modified_since?(modified_since, last_modified)
   end
 
-  defp none_match?(nil, _), do: false
-  defp none_match?(_, nil), do: false
+  defp get_fingerprint_header(%{method: method} = conn) when is_query(method) do
+    conn
+    |> get_req_header("if-none-match")
+    |> List.first()
+  end
 
-  defp none_match?(none_match, {_type, etag}) do
-    none_match = Plug.Conn.Utils.list(none_match)
+  defp get_fingerprint_header(%{method: method} = conn) when is_mutation(method) do
+    conn
+    |> get_req_header("if-match")
+    |> List.first()
+  end
 
-    etag not in none_match
+  defp get_timestamp_header(%{method: method} = conn) when is_query(method) do
+    conn
+    |> get_req_header("if-modified_since")
+    |> List.first()
+  end
+
+  defp get_timestamp_header(%{method: method} = conn) when is_mutation(method) do
+    conn
+    |> get_req_header("if-not-modified_since")
+    |> List.first()
+  end
+
+  defp fingerprint_match?(nil, _), do: false
+  defp fingerprint_match?(_, nil), do: false
+
+  defp fingerprint_match?(fingerprint, {_type, etag}) do
+    fingerprint = Plug.Conn.Utils.list(fingerprint)
+
+    etag in fingerprint
   end
 
   defp modified_since?(nil, _), do: false
